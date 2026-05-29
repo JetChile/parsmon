@@ -1,0 +1,18 @@
+[Unit]
+Description=ParsMon -> Telegram alert monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Папка, куда вы положили monitor.py и .env
+WorkingDirectory=/opt/parsmon
+EnvironmentFile=/opt/parsmon/.env
+ExecStart=/usr/bin/python3 /opt/parsmon/monitor.py --loop
+Restart=always
+RestartSec=10
+# Состояние (state.json) пишется в WorkingDirectory
+StateDirectory=parsmon
+
+[Install]
+WantedBy=multi-user.target

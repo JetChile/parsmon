@@ -1,0 +1,47 @@
+# DigitalOcean App Platform spec — ParsMon (WORKER, фоновый процесс).
+#
+# ⚠️ Отдельное приложение, НИКАК не связано с task-jet-prod (Django).
+#    Источник правды — DO UI; этот файл = рецепт + для doctl.
+#
+# Создание через UI:
+#   1. DO → Apps → Create App → GitHub → JetChile/parsmon, ветка main
+#   2. DO найдёт Dockerfile и по умолчанию предложит Web Service —
+#      ПЕРЕКЛЮЧИ тип ресурса на **Worker** (HTTP-порт не нужен).
+#   3. Environment → задать BOT_TOKEN (тип Encrypted). Остальные env — ниже.
+#   4. Размер basic-xxs (~$5/мес). Домена/DNS нет — это фоновый процесс.
+#
+# Или через doctl:
+#   doctl apps create --spec .do/app.yaml   (потом BOT_TOKEN задать в UI)
+
+name: parsmon
+region: nyc
+
+workers:
+  - name: monitor
+    github:
+      repo: JetChile/parsmon
+      branch: main
+      deploy_on_push: true
+    dockerfile_path: Dockerfile
+    instance_count: 1
+    instance_size_slug: basic-xxs   # ~$5/мес, stdlib-скрипту хватает с запасом
+    envs:
+      # Токен @parsmonbot — ТОЛЬКО как Encrypted в UI, в git его нет.
+      - key: BOT_TOKEN
+        scope: RUN_TIME
+        type: SECRET
+      # Группа-источник с закреплёнными «Чек #N» и списком самокатов.
+      - key: SOURCE_CHAT_ID
+        value: "-1002300878026"
+      # Чат, куда падают алерты операторам (на испанском).
+      - key: ALERT_CHAT_ID
+        value: "-1003727768555"
+      # getupdates требует у бота выключенный privacy mode ИЛИ права админа
+      # в группе-источнике (см. README). Иначе бот не видит сообщения группы.
+      - key: READ_MODE
+        value: "getupdates"
+      # Период опроса, сек.
+      - key: LOOP_SECONDS
+        value: "120"
+      # ⚠️ Диск воркера эфемерный: state.json не переживает рестарт →
+      # после рестарта/деплоя бот один раз пришлёт стартовый снимок. Это норм.
