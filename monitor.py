@@ -14,19 +14,19 @@ technical app.
 Only standard library is used (urllib). No external deps.
 
 Config via environment variables (see README.md):
-  BOT_TOKEN        Telegram bot token (8025342588:....)
-  SOURCE_CHAT_ID   group with the pinned messages   (default -1002300878026)
-  ALERT_CHAT_ID    chat where alerts are sent        (default -1003727768555)
-  CHEK_MSG_ID      message_id of the "Чек #N" message (read mode = forward)
-  SCOOTER_MSG_ID   message_id of the scooter message  (read mode = forward)
-  READ_MODE        "getupdates" (default) | "forward" | "getchat"
-  LOG_CHAT_ID      chat used to read messages in forward mode (default = ALERT_CHAT_ID)
-  STATE_FILE       path to persisted state (default ./state.json)
+    BOT_TOKEN        Telegram bot token (8025342588:....)
+    SOURCE_CHAT_ID   group with the pinned messages   (default -1002300878026)
+    ALERT_CHAT_ID    chat where alerts are sent        (default -1003727768555)
+    CHEK_MSG_ID      message_id of the "Чек #N" message (read mode = forward)
+    SCOOTER_MSG_ID   message_id of the scooter message  (read mode = forward)
+    READ_MODE        "getupdates" (default) | "forward" | "getchat"
+    LOG_CHAT_ID      chat used to read messages in forward mode (default = ALERT_CHAT_ID)
+    STATE_FILE       path to persisted state (default ./state.json)
 
 Run modes:
-  python monitor.py --selftest   parse the bundled sample messages and print result
-  python monitor.py --once       run one poll cycle (default)
-  python monitor.py --loop       run continuously (for a server / VPS)
+    python monitor.py --selftest   parse the bundled sample messages and print result
+    python monitor.py --once       run one poll cycle (default)
+    python monitor.py --loop       run continuously (for a server / VPS)
 """
 
 import os
@@ -58,15 +58,26 @@ API = "https://api.telegram.org/bot{token}/{method}"
 # scooter message).  NOTE: prefixes/substrings stay in Russian because they
 # must match the source messages; only the label is shown to operators.
 POINTS = {
-    "5":   ("Error crítico",       r"^5\.\s",   "критическая ошибка"),
-    "8":   ("Sin conexión",        r"^8\.\s",   "нет связи"),
-    "9":   ("Fuera de zona",       r"^9\.\s",   "за зоной завершения"),
-    "11":  ("Alarma",              r"^11\.\s",  "тревога"),
-    "2.1": ("Batería baja >12h",   r"^2\.1\b",  "низкий заряд батареи"),
+    "5":   ("Error crítico",     r"^5\.\s",   "критическая ошибка"),
+    "8":   ("Sin conexión",      r"^8\.\s",   "нет связи"),
+    "9":   ("Fuera de zona",     r"^9\.\s",   "за зоной завершения"),
+    "11":  ("Alarma",            r"^11\.\s",  "тревога"),
+    "2.1": ("Batería baja >12h", r"^2\.1\b",  "низкий заряд батареи"),
 }
 # Fixed order for display.
 ORDER = ["5", "8", "9", "11", "2.1"]
 
+# Emoji per status category (replaces ordinal numbers).
+EMOJI = {
+    "5":   "\U0001f525",   # 🔥
+    "8":   "\U0001f4e1",   # 📡
+    "9":   "\U0001f6a9",   # 🚩
+    "11":  "⚠️", # ⚠️
+    "2.1": "⚡",       # ⚡
+}
+
+# Max scooters shown per subcategory before truncation.
+MAX_SCOOTERS_PER_CAT = 15
 
 # --------------------------------------------------------------------------- #
 # Parsers
@@ -76,9 +87,8 @@ def _count_before_ts(line):
     m = re.findall(r"(\d+)\s*тс", line)
     return int(m[-1]) if m else None
 
-
 def parse_chek(text):
-    """Parse the 'Чек #N' digest. Returns dict with chek number, header and
+    """Parse the 'Чек #N' digest.  Returns dict with chek number, header and
     counters for the five tracked points."""
     result = {"chek": None, "header": None, "counters": {}}
     if not text:
@@ -90,7 +100,7 @@ def parse_chek(text):
 
     # Header line like "Santiago 29.05 14:30"
     hm = re.search(r"^([A-Za-zА-Яа-я ]+\s+\d{1,2}\.\d{1,2}\s+\d{1,2}:\d{2})",
-                   text, re.MULTILINE)
+                    text, re.MULTILINE)
     if hm:
         result["header"] = hm.group(1).strip()
 
@@ -104,16 +114,15 @@ def parse_chek(text):
                 break
     return result
 
-
 # Header line of a category block, e.g.
 #   "🔥 Критическая ошибка более 12 часов: 2 тс."
 #   "✅ Нет связи более 6 часов: 0 тс."
-_HEADER_RE = re.compile(r"^\W*(\w.*?):\s*(\d+)\s*тс", re.UNICODE)
-_SCOOTER_RE = re.compile(r"S\.\d+")
-
+_HEADER_RE  = re.compile(r"^\W*(\w.*?):\s*(\d+)\s*тс", re.UNICODE)
+_SCOOTER_HOURS_RE = re.compile(r"(S\.\d+)\s*(?:\((\d+)ч\.?\))?")
 
 def parse_scooters(text):
-    """Parse the scooter-list message into {category_name: [S.xxxx, ...]}."""
+    """Parse the scooter-list message into {category_name: [(code, hours), ...]}.
+    hours is a string like '15' or '' if not present."""
     blocks = {}
     current = None
     if not text:
@@ -128,35 +137,46 @@ def parse_scooters(text):
             blocks[current] = []
             continue
         if current is not None:
-            for code in _SCOOTER_RE.findall(line):
-                blocks[current].append(code)
+            for m in _SCOOTER_HOURS_RE.finditer(line):
+                code = m.group(1)
+                hours = m.group(2) or ""
+                blocks[current].append((code, hours))
     return blocks
-
 
 def scooters_for_points(scooter_blocks):
     """Map parsed category blocks to the five tracked points by substring."""
     out = {k: [] for k in POINTS}
-    for cat_name, codes in scooter_blocks.items():
+    for cat_name, entries in scooter_blocks.items():
         low = cat_name.lower()
         for key, (_label, _prefix, sub) in POINTS.items():
             if sub in low:
-                out[key] = codes
+                out[key] = entries
                 break
     return out
 
+def _code(entry):
+    """Extract scooter code from entry (tuple or plain string)."""
+    if isinstance(entry, (list, tuple)):
+        return entry[0]
+    return entry
+
+def _hours(entry):
+    """Extract hours string from entry (tuple or plain string)."""
+    if isinstance(entry, (list, tuple)) and len(entry) > 1:
+        return entry[1]
+    return ""
 
 def build_state(chek_text, scooter_text):
     """Combine both messages into a single comparable state object."""
-    chek = parse_chek(chek_text)
+    chek   = parse_chek(chek_text)
     blocks = parse_scooters(scooter_text)
-    scoot = scooters_for_points(blocks)
+    scoot  = scooters_for_points(blocks)
     return {
-        "chek": chek["chek"],
-        "header": chek["header"],
+        "chek":     chek["chek"],
+        "header":   chek["header"],
         "counters": chek["counters"],
         "scooters": scoot,
     }
-
 
 # --------------------------------------------------------------------------- #
 # Change detection + alert formatting
@@ -166,10 +186,10 @@ def diff_states(old, new):
     if old is None:
         old = {}
     changed = {
-        "new_chek": new.get("chek") != old.get("chek"),
-        "counter_changes": {},
-        "new_scooters": {},
-        "is_first": not old,
+        "new_chek":          new.get("chek") != old.get("chek"),
+        "counter_changes":   {},
+        "new_scooters":      {},
+        "is_first":          not old,
     }
     old_c = old.get("counters", {})
     for k in ORDER:
@@ -178,9 +198,10 @@ def diff_states(old, new):
 
     old_s = old.get("scooters", {})
     for k in ORDER:
-        new_set = set(new["scooters"].get(k, []))
-        old_set = set(old_s.get(k, []))
-        added = [c for c in new["scooters"].get(k, []) if c not in old_set]
+        new_codes = [_code(e) for e in new["scooters"].get(k, [])]
+        old_codes = [_code(e) for e in old_s.get(k, [])]
+        old_set   = set(old_codes)
+        added = [c for c in new_codes if c not in old_set]
         if added:
             changed["new_scooters"][k] = added
 
@@ -188,14 +209,13 @@ def diff_states(old, new):
                 or changed["new_scooters"])
     return changed if relevant else None
 
-
 def format_alert(new, changed):
     """Build the alert text (HTML parse mode)."""
     lines = []
     if changed.get("is_first"):
-        head = "🔔 <b>Monitor iniciado</b>"
+        head = "\U0001f514 <b>Monitor iniciado</b>"
     elif changed["new_chek"]:
-        head = "🔔 <b>Nuevo chequeo #{}</b>".format(new.get("chek"))
+        head = "\U0001f514 <b>Nuevo chequeo #{}</b>".format(new.get("chek"))
     else:
         head = "⚠️ <b>Cambio de estado (chequeo #{})</b>".format(new.get("chek"))
     if new.get("header"):
@@ -205,30 +225,47 @@ def format_alert(new, changed):
         lines.append("Verifique el estado en la aplicación técnica.")
     lines.append("")
 
+    # ── Counters (with emoji, no ordinal numbers) ──
     lines.append("<b>Contadores:</b>")
     for k in ORDER:
         label = POINTS[k][0]
-        cnt = new["counters"].get(k)
+        emoji = EMOJI.get(k, "•")
+        cnt   = new["counters"].get(k)
         cnt_s = "—" if cnt is None else str(cnt)
-        mark = ""
+        mark  = ""
         if k in changed["counter_changes"]:
             old_v, new_v = changed["counter_changes"][k]
             if old_v is not None and not changed.get("is_first"):
                 mark = "  (antes {})".format(old_v)
-        lines.append("{}. {}: <b>{}</b>{}".format(k, label, cnt_s, mark))
+        lines.append("{} {}: <b>{}</b>{}".format(emoji, label, cnt_s, mark))
 
-    # Scooter numbers
+    # ── Scooter list (one per line, with hours, truncated at 15) ──
     scoot_lines = []
     for k in ORDER:
-        codes = new["scooters"].get(k, [])
-        if not codes:
+        entries = new["scooters"].get(k, [])
+        if not entries:
             continue
-        added = set(changed["new_scooters"].get(k, []))
-        shown = []
-        for c in codes:
-            shown.append("🆕" + c if c in added else c)
-        scoot_lines.append("{} {} ({}): {}".format(
-            "🆕" if added else "•", POINTS[k][0], len(codes), ", ".join(shown)))
+        added_codes = set(changed["new_scooters"].get(k, []))
+        emoji = EMOJI.get(k, "•")
+        label = POINTS[k][0]
+        total = len(entries)
+
+        scoot_lines.append("")
+        scoot_lines.append("{} {} ({}):".format(emoji, label, total))
+
+        display = entries[:MAX_SCOOTERS_PER_CAT]
+        for entry in display:
+            code  = _code(entry)
+            hours = _hours(entry)
+            is_new = code in added_codes
+            prefix = "\U0001f195" if is_new else emoji   # 🆕 or category emoji
+            h_str  = " ({}h)".format(hours) if hours else ""
+            scoot_lines.append("  {} {}{}".format(prefix, code, h_str))
+
+        if total > MAX_SCOOTERS_PER_CAT:
+            scoot_lines.append("  <i>...y {} más</i>".format(
+                total - MAX_SCOOTERS_PER_CAT))
+
     if scoot_lines:
         lines.append("")
         lines.append("<b>Scooters:</b>")
@@ -236,26 +273,23 @@ def format_alert(new, changed):
 
     return "\n".join(lines)
 
-
 # --------------------------------------------------------------------------- #
 # Telegram transport
 # --------------------------------------------------------------------------- #
 def _api(method, params=None):
-    url = API.format(token=BOT_TOKEN, method=method)
+    url  = API.format(token=BOT_TOKEN, method=method)
     data = urllib.parse.urlencode(params or {}).encode() if params else None
-    req = urllib.request.Request(url, data=data)
+    req  = urllib.request.Request(url, data=data)
     with urllib.request.urlopen(req, timeout=60) as r:
         return json.loads(r.read().decode())
 
-
 def send_alert(text):
     return _api("sendMessage", {
-        "chat_id": ALERT_CHAT_ID,
-        "text": text,
+        "chat_id":    ALERT_CHAT_ID,
+        "text":       text,
         "parse_mode": "HTML",
         "disable_web_page_preview": "true",
     })
-
 
 def _norm(chat_id):
     """Normalise a chat id to its numeric core for comparison."""
@@ -265,28 +299,26 @@ def _norm(chat_id):
         s = s[3:]
     return s
 
-
 def read_via_getchat():
     """Return text of the single currently-pinned message (last pinned)."""
-    res = _api("getChat", {"chat_id": SOURCE_CHAT_ID})
+    res    = _api("getChat", {"chat_id": SOURCE_CHAT_ID})
     pinned = res.get("result", {}).get("pinned_message", {})
     return pinned.get("text") or pinned.get("caption") or ""
 
-
 def read_via_forward(msg_id):
     """Read a message by id by forwarding it to LOG_CHAT_ID, then delete it.
-    Returns the message text. Does NOT consume getUpdates (safe alongside the
+    Returns the message text.  Does NOT consume getUpdates (safe alongside the
     producer bot)."""
     if not msg_id:
         return ""
     res = _api("forwardMessage", {
-        "chat_id": LOG_CHAT_ID,
+        "chat_id":      LOG_CHAT_ID,
         "from_chat_id": SOURCE_CHAT_ID,
-        "message_id": msg_id,
+        "message_id":   msg_id,
         "disable_notification": "true",
     })
-    msg = res.get("result", {})
-    text = msg.get("text") or msg.get("caption") or ""
+    msg    = res.get("result", {})
+    text   = msg.get("text") or msg.get("caption") or ""
     fwd_id = msg.get("message_id")
     if fwd_id:
         try:
@@ -295,10 +327,9 @@ def read_via_forward(msg_id):
             pass
     return text
 
-
 def read_via_getupdates(state):
     """Consume getUpdates and keep the latest text of the Чек and scooter
-    messages, classified by their content signature. Requires the bot to
+    messages, classified by their content signature.  Requires the bot to
     receive group messages (privacy mode OFF or bot is admin)."""
     offset = state.get("update_offset", 0)
     params = {"timeout": 0, "allowed_updates": json.dumps(
@@ -306,9 +337,9 @@ def read_via_getupdates(state):
     if offset:
         params["offset"] = offset
     res = _api("getUpdates", params)
-    chek_text = state.get("chek_text", "")
+    chek_text  = state.get("chek_text", "")
     scoot_text = state.get("scooter_text", "")
-    max_id = offset - 1
+    max_id     = offset - 1
     for upd in res.get("result", []):
         max_id = max(max_id, upd.get("update_id", max_id))
         msg = (upd.get("message") or upd.get("edited_message")
@@ -320,14 +351,13 @@ def read_via_getupdates(state):
         if not text:
             continue
         if re.search(r"Чек\s*#\s*\d+", text):
-            chek_text = text
-        elif _SCOOTER_RE.search(text) and _HEADER_RE.search(text):
+            chek_text  = text
+        elif _SCOOTER_HOURS_RE.search(text) and _HEADER_RE.search(text):
             scoot_text = text
-    state["update_offset"] = max_id + 1
-    state["chek_text"] = chek_text
-    state["scooter_text"] = scoot_text
+    state["update_offset"]  = max_id + 1
+    state["chek_text"]      = chek_text
+    state["scooter_text"]   = scoot_text
     return chek_text, scoot_text
-
 
 # --------------------------------------------------------------------------- #
 # State persistence
@@ -338,11 +368,9 @@ def load_state():
             return json.load(f)
     return {}
 
-
 def save_state(state):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
-
 
 # --------------------------------------------------------------------------- #
 # Main cycle
@@ -360,18 +388,17 @@ def fetch_texts(state):
     # default: getupdates
     return read_via_getupdates(state)
 
-
 def run_once():
     state = load_state()
     chek_text, scoot_text = fetch_texts(state)
-    new = build_state(chek_text, scoot_text)
-    prev = state.get("snapshot")
+    new     = build_state(chek_text, scoot_text)
+    prev    = state.get("snapshot")
     changed = diff_states(prev, new)
     if changed:
         text = format_alert(new, changed)
         try:
             resp = send_alert(text)
-            ok = resp.get("ok")
+            ok   = resp.get("ok")
         except Exception as e:
             ok = False
             print("send error:", e)
@@ -382,7 +409,6 @@ def run_once():
     save_state(state)
     return changed is not None
 
-
 def run_loop():
     while True:
         try:
@@ -390,7 +416,6 @@ def run_loop():
         except Exception as e:
             print("cycle error:", e)
         time.sleep(LOOP_SECONDS)
-
 
 # --------------------------------------------------------------------------- #
 # Self test (no network) — uses the two real sample messages
@@ -417,15 +442,15 @@ Santiago 29.05 14:30
 12. В работе СБ 12 тс.
 """
 
-SAMPLE_SCOOTERS = """🔥 В доступе с сервисным режимом: 4 тс.
+SAMPLE_SCOOTERS = """f525 В доступе с сервисным режимом: 4 тс.
 S.269862
 S.270727
 
-🔥 55 ошибка: 48 тс.
+f525 55 ошибка: 48 тс.
 S.269548
 S.269861
 
-🔥 Низкий заряд батареи более 12 часов: 13 тс.
+f525 Низкий заряд батареи более 12 часов: 13 тс.
 S.271317 (15ч.)
 S.271729 (14ч.)
 S.321137 (716ч.)
@@ -436,15 +461,14 @@ S.321137 (716ч.)
 
 ✅ За зоной завершения более 6 часов: 0 тс.
 
-🔥 Ожидание ремонта СЦ более 6 часов: 2 тс.
+f525 Ожидание ремонта СЦ более 6 часов: 2 тс.
 S.306978
 S.320746
 
-🔥 Критическая ошибка более 12 часов: 2 тс.
+f525 Критическая ошибка более 12 часов: 2 тс.
 S.269612
 S.275132
 """
-
 
 def selftest():
     print("=== parse_chek ===")
@@ -469,18 +493,18 @@ def selftest():
     new2["chek"] = 77
     new2["header"] = "Santiago 29.05 15:30"
     new2["counters"]["5"] = 4
-    new2["scooters"]["5"] = ["S.269612", "S.275132", "S.999999"]
+    new2["scooters"]["5"] = [("S.269612", "26"), ("S.275132", "14"), ("S.999999", "")]
     changed2 = diff_states(state, new2)
     print(format_alert(new2, changed2))
 
     # sanity assertions
     assert chek["chek"] == 76
     assert chek["counters"] == {"5": 3, "8": 0, "9": 0, "11": 5, "2.1": 13}, chek["counters"]
-    assert state["scooters"]["5"] == ["S.269612", "S.275132"]
-    assert state["scooters"]["2.1"] == ["S.271317", "S.271729", "S.321137"]
+    assert [_code(e) for e in state["scooters"]["5"]] == ["S.269612", "S.275132"]
+    assert [_code(e) for e in state["scooters"]["2.1"]] == ["S.271317", "S.271729", "S.321137"]
+    assert [_hours(e) for e in state["scooters"]["2.1"]] == ["15", "14", "716"]
     assert state["scooters"]["8"] == []
     print("\nALL ASSERTIONS PASSED ✅")
-
 
 def main():
     arg = sys.argv[1] if len(sys.argv) > 1 else "--once"
@@ -490,7 +514,6 @@ def main():
         run_loop()
     else:
         run_once()
-
 
 if __name__ == "__main__":
     main()
