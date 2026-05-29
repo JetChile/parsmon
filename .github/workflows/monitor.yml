@@ -1,0 +1,55 @@
+name: ParsMon
+
+# Временный бесплатный режим: вместо постоянного процесса (DO Worker) гоняем
+# `monitor.py --once` по расписанию. Состояние (state.json) переносится между
+# запусками через кэш Actions — иначе бот слал бы стартовый снимок каждый раз.
+#
+# ⚠️ Лимит минут: на ПРИВАТНОМ репо GitHub даёт ~2000 мин/мес. Cron раз в 5 мин
+#    съест их за ~неделю. Варианты: сделать репо публичным (минуты безлимитны)
+#    ИЛИ увеличить интервал ниже до '*/30' (≈1440 мин/мес — влезает в бесплатные).
+#
+# ⚠️ Не запускать ОДНОВРЕМЕННО с DO-воркером на том же токене в режиме
+#    getupdates — Telegram отдаёт апдейты только одному потребителю (конфликт).
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # каждые 5 минут (GitHub может задерживать/пропускать)
+  workflow_dispatch: {}       # ручной запуск из вкладки Actions
+
+# Не запускать параллельно: getupdates и состояние должны идти строго по одному.
+concurrency:
+  group: parsmon-poll
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      # Восстановить state.json из предыдущего запуска (ключ с run_id уникален,
+      # restore-keys по префиксу подтянет самый свежий прошлый кэш).
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: parsmon-state-${{ github.run_id }}
+          restore-keys: |
+            parsmon-state-
+
+      - name: Poll once
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          SOURCE_CHAT_ID: ${{ vars.SOURCE_CHAT_ID || '-1002300878026' }}
+          ALERT_CHAT_ID: ${{ vars.ALERT_CHAT_ID || '-1003727768555' }}
+          READ_MODE: ${{ vars.READ_MODE || 'getupdates' }}
+        run: python3 monitor.py --once   # python3 уже есть в ubuntu-latest, deps не нужны
+
+      # Сохранить обновлённый state.json для следующего запуска.
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: parsmon-state-${{ github.run_id }}
